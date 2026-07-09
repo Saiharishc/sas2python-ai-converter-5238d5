@@ -23,6 +23,39 @@ async def get_llm_providers():
     return JSONResponse(content={"providers": ["gemini", "openai", "anthropic"]})
 
 
+def _strip_sas_comments(sas_code: str) -> str:
+    """Removes SAS comments so they're never mistaken for code or reported
+    as unsupported statements: block comments (/* ... */, possibly spanning
+    multiple lines, including a trailing comment on the same line as real
+    code) and line comments (a statement starting with "*" up to the next
+    ";"). A "*" is only treated as a comment starter at the beginning of a
+    statement (start of string or right after a prior ";"), so a literal
+    "*" used as multiplication inside an expression is left untouched.
+    """
+    without_block_comments = re.sub(r"/\*.*?\*/", "", sas_code, flags=re.DOTALL)
+
+    def _strip_star_comments(text: str) -> str:
+        out = []
+        i = 0
+        at_stmt_start = True
+        while i < len(text):
+            ch = text[i]
+            if at_stmt_start and ch == "*":
+                end = text.find(";", i)
+                i = end + 1 if end != -1 else len(text)
+                at_stmt_start = True
+                continue
+            out.append(ch)
+            if ch == ";":
+                at_stmt_start = True
+            elif not ch.isspace():
+                at_stmt_start = False
+            i += 1
+        return "".join(out)
+
+    return _strip_star_comments(without_block_comments)
+
+
 def _convert_sas_rule_based(sas_code: str) -> tuple[str, list[str], list[str]]:
     """Line-oriented rule-based translator for common SAS constructs.
 
@@ -31,6 +64,7 @@ def _convert_sas_rule_based(sas_code: str) -> tuple[str, list[str], list[str]]:
     else is preserved as a commented-out original line and reported in
     unsupported_statements.
     """
+    sas_code = _strip_sas_comments(sas_code)
     lines = [l.rstrip() for l in sas_code.splitlines() if l.strip()]
     py_lines: list[str] = ["import pandas as pd", ""]
     unsupported: list[str] = []

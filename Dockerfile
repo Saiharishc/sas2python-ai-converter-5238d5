@@ -1,6 +1,7 @@
 # Stage 1: build the React frontend
 FROM node:20-slim AS frontend-build
 WORKDIR /frontend
+ENV CI=false
 COPY package.json .
 RUN npm install
 COPY public ./public

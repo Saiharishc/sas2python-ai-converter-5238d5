@@ -56,6 +56,206 @@ def _strip_sas_comments(sas_code: str) -> str:
     return _strip_star_comments(without_block_comments)
 
 
+def _expand_sas_macros(sas_code: str) -> str:
+    """Expands %let variable assignments and non-recursive %macro/%mend
+    blocks by textual substitution, so the main line-by-line parser sees
+    plain SAS code instead of macro syntax it has no way to interpret.
+
+    Supported: "%let name = value;" definitions, "&name" / "&name." token
+    references, and "%macro name(params) ... %mend;" definitions expanded
+    at each "%name(args);" call site by substituting positional parameters
+    into the macro body. Nested macro calls, conditional macro logic
+    (%if/%then at compile time), and macro functions (%sysfunc, etc.) are
+    NOT expanded — a call to an unrecognized "%something" is left as-is,
+    which then falls through to the main parser and is reported as
+    unsupported like any other unrecognized statement.
+    """
+    let_re = re.compile(r"%let\s+(\w+)\s*=\s*(.*?);", re.IGNORECASE | re.DOTALL)
+    macro_def_re = re.compile(
+        r"%macro\s+(\w+)\s*(\(([^)]*)\))?\s*;(.*?)%mend\s*(\w+)?\s*;",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    macro_vars: dict[str, str] = {}
+    for m in let_re.finditer(sas_code):
+        macro_vars[m.group(1)] = m.group(2).strip()
+    sas_code = let_re.sub("", sas_code)
+
+    macros: dict[str, tuple[list[str], str]] = {}
+
+    def _capture_macro(m: re.Match) -> str:
+        name = m.group(1)
+        params_raw = m.group(3) or ""
+        params = [p.strip() for p in params_raw.split(",") if p.strip()]
+        body = m.group(4)
+        macros[name.lower()] = (params, body)
+        return ""
+
+    sas_code = macro_def_re.sub(_capture_macro, sas_code)
+
+    def _substitute_vars(text: str, local_vars: dict[str, str]) -> str:
+        all_vars = {**macro_vars, **local_vars}
+        for name in sorted(all_vars, key=len, reverse=True):
+            text = re.sub(rf"&{re.escape(name)}\.", all_vars[name], text, flags=re.IGNORECASE)
+            text = re.sub(rf"&{re.escape(name)}\b", all_vars[name], text, flags=re.IGNORECASE)
+        return text
+
+    def _expand_calls(text: str) -> str:
+        call_re = re.compile(r"%(\w+)\s*(\(([^)]*)\))?\s*;")
+
+        def _replace(m: re.Match) -> str:
+            name = m.group(1).lower()
+            if name not in macros:
+                return m.group(0)
+            params, body = macros[name]
+            args_raw = m.group(3) or ""
+            args = [a.strip() for a in args_raw.split(",")] if args_raw.strip() else []
+            local_vars = dict(zip(params, args))
+            expanded_body = _substitute_vars(body, local_vars)
+            return expanded_body
+
+        prev = None
+        while prev != text:
+            prev = text
+            text = call_re.sub(_replace, text)
+        return text
+
+    sas_code = _expand_calls(sas_code)
+    sas_code = _substitute_vars(sas_code, {})
+    return sas_code
+
+
+def _convert_proc_sql_block(sql: str) -> tuple[list[str], list[str]]:
+    """Translates a constrained subset of PROC SQL to pandas: a single
+    SELECT with optional WHERE / GROUP BY / ORDER BY, an optional single
+    INNER/LEFT JOIN ... ON, and an optional "INTO :var" clause capturing
+    one column's values into a Python list. Anything outside this shape
+    (subqueries, multiple joins, HAVING, UNION, etc.) is reported as
+    unsupported and left as a SQL comment in the output.
+    """
+    py_lines: list[str] = []
+    unsupported: list[str] = []
+
+    select_re = re.compile(
+        r"select\s+(distinct\s+)?(.+?)\s+"
+        r"(into\s+:(\w+)\s*(separated\s+by\s+'([^']*)')?\s+)?"
+        r"from\s+([\w.]+)(\s+as\s+(\w+)|\s+(\w+))?"
+        r"(\s+(inner|left)\s+join\s+([\w.]+)(\s+as\s+(\w+)|\s+(\w+))?\s+on\s+(.+?))?"
+        r"(\s+where\s+(.+?))?"
+        r"(\s+group\s+by\s+(.+?))?"
+        r"(\s+order\s+by\s+(.+?))?"
+        r"\s*;",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    create_table_re = re.compile(r"^\s*create\s+table\s+(\w+)\s+as\s+(.*)$", re.IGNORECASE | re.DOTALL)
+
+    def sql_expr_to_py(expr: str) -> str:
+        expr = re.sub(r"\bne\b", "!=", expr, flags=re.IGNORECASE)
+        expr = re.sub(r"\beq\b", "==", expr, flags=re.IGNORECASE)
+        expr = re.sub(r"=(?!=)", "==", expr)
+        expr = re.sub(r"\band\b", "and", expr, flags=re.IGNORECASE)
+        expr = re.sub(r"\bor\b", "or", expr, flags=re.IGNORECASE)
+        return expr.strip()
+
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    for stmt in statements:
+        target_table: str | None = None
+        if ct := create_table_re.match(stmt):
+            target_table = ct.group(1)
+            stmt = ct.group(2)
+
+        # Constructs this single-table/single-join translator can't
+        # represent correctly: nested "select" (subquery), HAVING, UNION,
+        # and aggregate function calls in the column list (count(*), sum(),
+        # etc., which need groupby().agg() rather than a plain column
+        # projection). Flagging these as unsupported is safer than silently
+        # emitting a query string that looks plausible but is wrong or
+        # invalid pandas syntax at runtime.
+        unsupported_markers = [
+            (r"\bselect\b.*\bselect\b", "subquery"),
+            (r"\bhaving\b", "HAVING clause"),
+            (r"\bunion\b", "UNION"),
+            (r"\w+\s*\([^)]*\)\s*(as\s+\w+)?\s*(,|from\b)", "aggregate/function call in SELECT list"),
+        ]
+        matched_marker = next(
+            (label for pattern, label in unsupported_markers if re.search(pattern, stmt, re.IGNORECASE | re.DOTALL)),
+            None,
+        )
+        if matched_marker:
+            unsupported.append(f"proc sql: {stmt};")
+            py_lines.append(f"# UNSUPPORTED SQL ({matched_marker} not supported): {stmt};")
+            continue
+
+        m = select_re.match(stmt + ";")
+        if not m:
+            unsupported.append(f"proc sql: {stmt};")
+            py_lines.append(f"# UNSUPPORTED SQL: {stmt};")
+            continue
+
+        (_distinct, cols, _into_full, into_var, _sep_full, _sep, from_table,
+         _alias1, alias1a, alias1b, _join_full, join_type, join_table,
+         _alias2, alias2a, alias2b, join_on, _where_full, where_clause,
+         _groupby_full, groupby, _orderby_full, orderby) = m.groups()
+
+        alias1 = alias1a or alias1b
+        alias2 = alias2a or alias2b
+        left_ref = alias1 or from_table
+        result_var = target_table or "sql_result"
+
+        def strip_aliases(text: str) -> str:
+            for alias in (a for a in (alias1, alias2, from_table) if a):
+                text = re.sub(rf"\b{re.escape(alias)}\.(\w+)", r"\1", text)
+            return text
+
+        expr = f"{from_table}.copy()"
+        if alias1:
+            py_lines.append(f"{alias1} = {from_table}")
+
+        if join_table:
+            join_alias = alias2 or join_table
+            if alias2:
+                py_lines.append(f"{alias2} = {join_table}")
+            how = "inner" if (join_type or "").lower() == "inner" else "left"
+            on_parts = re.split(r"\s+and\s+", join_on, flags=re.IGNORECASE)
+            left_cols, right_cols = [], []
+            for part in on_parts:
+                lhs, rhs = [p.strip() for p in part.split("=")]
+                left_cols.append(lhs.split(".")[-1])
+                right_cols.append(rhs.split(".")[-1])
+            expr = (
+                f"{left_ref}.merge({join_alias}, how='{how}', "
+                f"left_on={left_cols!r}, right_on={right_cols!r})"
+            )
+
+        py_lines.append(f"{result_var} = {expr}")
+
+        if where_clause:
+            where_py = sql_expr_to_py(strip_aliases(where_clause))
+            py_lines.append(f"{result_var} = {result_var}.query('{where_py}')")
+
+        if groupby:
+            group_cols = [strip_aliases(c.strip()) for c in groupby.split(",")]
+            cols_py = ", ".join(f'"{c}"' for c in group_cols)
+            py_lines.append(f"{result_var} = {result_var}.groupby([{cols_py}]).first().reset_index()")
+
+        if orderby:
+            order_cols = [strip_aliases(c.strip()) for c in orderby.split(",")]
+            cols_py = ", ".join(f'"{c}"' for c in order_cols)
+            py_lines.append(f"{result_var} = {result_var}.sort_values([{cols_py}])")
+
+        if cols.strip() != "*":
+            col_list = [c.strip().split(" as ")[-1].split(".")[-1].strip() for c in cols.split(",")]
+            cols_py = ", ".join(f'"{c}"' for c in col_list)
+            py_lines.append(f"{result_var} = {result_var}[[{cols_py}]]")
+
+        if into_var:
+            col_name = cols.strip().split(" as ")[-1].split(".")[-1].strip()
+            py_lines.append(f"{into_var} = {result_var}['{col_name}'].drop_duplicates().tolist()")
+
+    return py_lines, unsupported
+
+
 def _convert_sas_rule_based(sas_code: str) -> tuple[str, list[str], list[str]]:
     """Line-oriented rule-based translator for common SAS constructs.
 
@@ -65,6 +265,7 @@ def _convert_sas_rule_based(sas_code: str) -> tuple[str, list[str], list[str]]:
     unsupported_statements.
     """
     sas_code = _strip_sas_comments(sas_code)
+    sas_code = _expand_sas_macros(sas_code)
     lines = [l.rstrip() for l in sas_code.splitlines() if l.strip()]
     py_lines: list[str] = ["import pandas as pd", ""]
     unsupported: list[str] = []
@@ -83,6 +284,7 @@ def _convert_sas_rule_based(sas_code: str) -> tuple[str, list[str], list[str]]:
     proc_sort_re = re.compile(r"^\s*proc\s+sort\s+data\s*=\s*(\w+)", re.IGNORECASE)
     by_re = re.compile(r"^\s*by\s+(.+?);", re.IGNORECASE)
     proc_means_re = re.compile(r"^\s*proc\s+means\s+data\s*=\s*(\w+)", re.IGNORECASE)
+    proc_sql_re = re.compile(r"^\s*proc\s+sql\b", re.IGNORECASE)
     quit_re = re.compile(r"^\s*quit\s*;", re.IGNORECASE)
 
     def sas_expr_to_py(expr: str) -> str:
@@ -112,6 +314,21 @@ def _convert_sas_rule_based(sas_code: str) -> tuple[str, list[str], list[str]]:
             if current_df:
                 py_lines.append(f"{current_df} = {source_df}.copy()")
             i += 1
+            continue
+
+        if proc_sql_re.match(line):
+            i += 1
+            sql_lines: list[str] = []
+            while i < len(lines) and not quit_re.match(lines[i]):
+                sql_lines.append(lines[i])
+                i += 1
+            if i < len(lines):
+                i += 1  # consume the "quit;" line
+            sql_text = " ".join(sql_lines)
+            sql_py_lines, sql_unsupported = _convert_proc_sql_block(sql_text)
+            py_lines.extend(sql_py_lines)
+            py_lines.append("")
+            unsupported.extend(sql_unsupported)
             continue
 
         if run_re.match(line) or quit_re.match(line):
